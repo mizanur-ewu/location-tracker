@@ -25,6 +25,7 @@ async function initDb() {
       recorded_at TIMESTAMPTZ NOT NULL
     );
     CREATE INDEX IF NOT EXISTS locations_trip_idx ON locations(trip_id, recorded_at);
+    ALTER TABLE locations ADD COLUMN IF NOT EXISTS accuracy DOUBLE PRECISION;
   `);
 }
 
@@ -40,24 +41,48 @@ function haversine(a, b) {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
-function summarize(trip, points) {
-  let distance = 0;
-  for (let i = 1; i < points.length; i++) distance += haversine(points[i - 1], points[i]);
+// GPS drifts a few meters (much more indoors) even when you stand still.
+// Keep the same numbers in mobile/src/format.js.
+const MAX_ACCURACY_M = 30; // ignore fixes less accurate than this
+const MIN_MOVE_M = 15; // ignore movement smaller than this
 
+// Removes GPS noise: drops inaccurate fixes and only adds a point
+// once you've moved far enough from the last kept point.
+function cleanPath(points) {
+  const path = [];
+  for (const p of points) {
+    if (p.accuracy != null && p.accuracy > MAX_ACCURACY_M) continue;
+    const last = path[path.length - 1];
+    if (!last || haversine(last, p) >= Math.max(MIN_MOVE_M, p.accuracy ?? 0)) path.push(p);
+  }
+  // Every fix was inaccurate: still show where the trip was
+  if (path.length === 0 && points.length) path.push(points[0]);
+  return path;
+}
+
+function pathDistance(path) {
+  let total = 0;
+  for (let i = 1; i < path.length; i++) total += haversine(path[i - 1], path[i]);
+  return total;
+}
+
+function summarize(trip, points, path = cleanPath(points)) {
+  const lastPoint = points[points.length - 1];
   const start = new Date(trip.started_at).getTime();
-  const end = trip.ended_at ? new Date(trip.ended_at).getTime() : Date.now();
+  // A trip that was never stopped (e.g. app closed) ends at its last point
+  const end = new Date(trip.ended_at ?? lastPoint?.recorded_at ?? trip.started_at).getTime();
 
   return {
     ...trip,
     point_count: points.length,
-    distance_meters: Math.round(distance),
-    duration_seconds: Math.round((end - start) / 1000),
+    distance_meters: Math.round(pathDistance(path)),
+    duration_seconds: Math.max(0, Math.round((end - start) / 1000)),
   };
 }
 
 async function getPoints(tripId) {
   const { rows } = await pool.query(
-    'SELECT latitude, longitude, recorded_at FROM locations WHERE trip_id = $1 ORDER BY recorded_at',
+    'SELECT latitude, longitude, accuracy, recorded_at FROM locations WHERE trip_id = $1 ORDER BY recorded_at',
     [tripId]
   );
   return rows;
@@ -95,13 +120,13 @@ app.post('/trips/:id/stop', async (req, res) => {
 
 // Save a location point
 app.post('/locations', async (req, res) => {
-  const { trip_id, latitude, longitude, time } = req.body;
+  const { trip_id, latitude, longitude, accuracy, time } = req.body;
   if (trip_id == null || latitude == null || longitude == null) {
     return res.status(400).json({ error: 'trip_id, latitude and longitude are required' });
   }
   const { rows } = await pool.query(
-    'INSERT INTO locations (trip_id, latitude, longitude, recorded_at) VALUES ($1, $2, $3, $4) RETURNING *',
-    [trip_id, latitude, longitude, time ? new Date(time) : new Date()]
+    'INSERT INTO locations (trip_id, latitude, longitude, accuracy, recorded_at) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+    [trip_id, latitude, longitude, accuracy ?? null, time ? new Date(time) : new Date()]
   );
   res.json(rows[0]);
 });
@@ -113,12 +138,14 @@ app.get('/trips', async (req, res) => {
   res.json(result);
 });
 
-// One trip with its full path
+// One trip with its path.
+// `points` = every saved fix, `path` = cleaned points to draw on the map.
 app.get('/trips/:id', async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM trips WHERE id = $1', [req.params.id]);
   if (!rows[0]) return res.status(404).json({ error: 'Trip not found' });
   const points = await getPoints(rows[0].id);
-  res.json({ ...summarize(rows[0], points), points });
+  const path = cleanPath(points);
+  res.json({ ...summarize(rows[0], points, path), points, path });
 });
 
 // Basic error handler so a DB error doesn't crash the server
