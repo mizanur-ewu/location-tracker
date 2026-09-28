@@ -63,6 +63,20 @@ async function getPoints(tripId) {
   return rows;
 }
 
+app.get('/', (req, res) => {
+  res.json({ name: 'Location Tracker API', health: '/health' });
+});
+
+// Health check: confirms the server is up and the DB is reachable
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', db: 'ok', uptime_seconds: Math.round(process.uptime()), time: new Date() });
+  } catch (err) {
+    res.status(503).json({ status: 'error', db: 'unreachable', error: err.message, time: new Date() });
+  }
+});
+
 // Start a new trip
 app.post('/trips', async (req, res) => {
   const { rows } = await pool.query('INSERT INTO trips DEFAULT VALUES RETURNING *');
