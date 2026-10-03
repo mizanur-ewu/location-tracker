@@ -124,11 +124,19 @@ app.post('/locations', async (req, res) => {
   if (trip_id == null || latitude == null || longitude == null) {
     return res.status(400).json({ error: 'trip_id, latitude and longitude are required' });
   }
-  const { rows } = await pool.query(
-    'INSERT INTO locations (trip_id, latitude, longitude, accuracy, recorded_at) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-    [trip_id, latitude, longitude, accuracy ?? null, time ? new Date(time) : new Date()]
-  );
-  res.json(rows[0]);
+  try {
+    const { rows } = await pool.query(
+      'INSERT INTO locations (trip_id, latitude, longitude, accuracy, recorded_at) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [trip_id, latitude, longitude, accuracy ?? null, time ? new Date(time) : new Date()]
+    );
+    res.json(rows[0]);
+  } catch (err) {
+    // 422 = this point can never be saved, so the app drops it instead of retrying forever.
+    // 23503: the trip doesn't exist (e.g. it was deleted). 22xxx: invalid value (bad number/time).
+    if (err.code === '23503') return res.status(422).json({ error: 'Trip not found' });
+    if (err.code?.startsWith('22')) return res.status(422).json({ error: 'Invalid location data' });
+    throw err;
+  }
 });
 
 // List all trips with distance and duration
